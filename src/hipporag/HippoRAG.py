@@ -28,6 +28,8 @@ from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
 from .prompts.prompt_template_manager import PromptTemplateManager
 from .rerank import DSPyFilter
+from .context_aware_memory import ContextAwareMemoryManager
+from .conflict_resolution import ConflictResolver
 from .utils.misc_utils import *
 from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
@@ -156,6 +158,24 @@ class HippoRAG:
         self.rerank_filter = DSPyFilter(self)
 
         self.ready_to_retrieve = False
+        
+        # 初始化情境感知的动态记忆激活系统
+        self.memory_manager = ContextAwareMemoryManager(
+            context_window_size=getattr(self.global_config, 'context_window_size', 10),
+            recency_weight=getattr(self.global_config, 'recency_weight', 0.3),
+            frequency_weight=getattr(self.global_config, 'frequency_weight', 0.2),
+            relevance_weight=getattr(self.global_config, 'relevance_weight', 0.5),
+            relevance_threshold=getattr(self.global_config, 'relevance_threshold', 0.3),
+            decay_rate=getattr(self.global_config, 'decay_rate', 0.01)
+        )
+        
+        # 初始化冲突解决器
+        conflict_log_path = os.path.join(self.working_dir, 'conflict_audit_log.json')
+        self.conflict_resolver = ConflictResolver(
+            default_strategy=getattr(self.global_config, 'conflict_resolution_strategy', 'keep_new'),
+            enable_audit_log=True,
+            audit_log_file=conflict_log_path
+        )
 
         self.ppr_time = 0
         self.rerank_time = 0
@@ -408,6 +428,13 @@ class HippoRAG:
 
         for q_idx, query in tqdm(enumerate(queries), desc="Retrieving", total=len(queries)):
             rerank_start = time.time()
+            
+            # 为当前查询获取embedding，用于记录访问历史和计算动态激活
+            query_embedding_for_fact = self.query_to_embedding['triple'].get(query)
+            if query_embedding_for_fact is not None:
+                # 添加查询到上下文历史
+                self.memory_manager.add_query_context(query, query_embedding_for_fact)
+            
             query_fact_scores = self.get_fact_scores(query)
             top_k_fact_indices, top_k_facts, rerank_log = self.rerank_facts(query, query_fact_scores)
             rerank_end = time.time()
@@ -426,6 +453,28 @@ class HippoRAG:
                                                                                          passage_node_weight=self.global_config.passage_node_weight)
 
             top_k_docs = [self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"] for idx in sorted_doc_ids[:num_to_retrieve]]
+            
+            # 记录返回的文档的访问历史
+            for rank_pos, doc_idx in enumerate(sorted_doc_ids[:num_to_retrieve]):
+                chunk_hash_id = self.passage_node_keys[doc_idx]
+                doc_score = sorted_doc_scores[rank_pos] if rank_pos < len(sorted_doc_scores) else 0
+                
+                # 计算这个文档与查询的相似度
+                doc_embedding = self.chunk_embedding_store.get_embedding(chunk_hash_id)
+                if query_embedding_for_fact is not None:
+                    similarity = float(np.dot(query_embedding_for_fact, doc_embedding) / 
+                                     (np.linalg.norm(query_embedding_for_fact) * np.linalg.norm(doc_embedding) + 1e-10))
+                else:
+                    similarity = float(doc_score)
+                
+                # 记录访问
+                self.chunk_embedding_store.record_access(
+                    hash_id=chunk_hash_id,
+                    query=query,
+                    query_embedding=query_embedding_for_fact,
+                    ranking_position=rank_pos,
+                    similarity_score=similarity
+                )
 
             retrieval_results.append(QuerySolution(question=query, docs=top_k_docs, doc_scores=sorted_doc_scores[:num_to_retrieve]))
 
@@ -437,6 +486,20 @@ class HippoRAG:
         logger.info(f"Total Recognition Memory Time {self.rerank_time:.2f}s")
         logger.info(f"Total PPR Time {self.ppr_time:.2f}s")
         logger.info(f"Total Misc Time {self.all_retrieval_time - (self.rerank_time + self.ppr_time):.2f}s")
+        
+        # 自动应用情境感知的记忆消退
+        # 使用最后一个查询作为上下文
+        if len(queries) > 0 and getattr(self.global_config, 'auto_memory_decay', False):
+            last_query = queries[-1]
+            try:
+                decay_stats = self.apply_context_aware_memory_decay(
+                    current_query=last_query,
+                    retention_ratio=getattr(self.global_config, 'memory_retention_ratio', 0.9),
+                    auto_forget=True
+                )
+                logger.info(f"Automatic memory decay applied: {decay_stats}")
+            except Exception as e:
+                logger.warning(f"Automatic memory decay failed: {e}")
 
         # Evaluate retrieval
         if gold_docs is not None:
@@ -1568,6 +1631,289 @@ class HippoRAG:
         except Exception as e:
             logger.error(f"Error in rerank_facts: {str(e)}")
             return [], [], {'facts_before_rerank': [], 'facts_after_rerank': [], 'error': str(e)}
+    
+    def apply_context_aware_memory_decay(self, 
+                                        current_query: str = None,
+                                        retention_ratio: float = 0.9,
+                                        auto_forget: bool = True) -> Dict:
+        """
+        应用情境感知的记忆消退机制。
+        
+        仅删除持续与当前查询上下文无关且重要性低的记忆。
+        
+        Args:
+            current_query: 当前查询（用于计算激活分数）
+            retention_ratio: 保留的记忆比例（0-1）
+            auto_forget: 是否自动删除标记为不应该保留的记忆
+        
+        Returns:
+            包含消退统计信息的字典
+        """
+        if current_query is None or self.query_to_embedding['triple'].get(current_query) is None:
+            logger.warning("No valid current query for context-aware decay. Using default strategy.")
+            current_query_embedding = None
+        else:
+            current_query_embedding = self.query_to_embedding['triple'][current_query]
+        
+        decay_stats = {
+            'total_chunks': len(self.chunk_embedding_store.get_all_ids()),
+            'total_entities': len(self.entity_embedding_store.get_all_ids()),
+            'total_facts': len(self.fact_embedding_store.get_all_ids()),
+            'chunks_to_forget': [],
+            'entities_to_forget': [],
+            'facts_to_forget': []
+        }
+        
+        # 对各个存储分别计算消退
+        if current_query_embedding is not None:
+            # 计算chunk的激活分数
+            chunk_ids_to_forget = self.memory_manager.get_memories_to_forget(
+                self.chunk_embedding_store,
+                current_query_embedding,
+                retention_ratio=retention_ratio
+            )
+            decay_stats['chunks_to_forget'] = chunk_ids_to_forget
+            
+            # 计算entity的激活分数
+            entity_ids_to_forget = self.memory_manager.get_memories_to_forget(
+                self.entity_embedding_store,
+                current_query_embedding,
+                retention_ratio=retention_ratio
+            )
+            decay_stats['entities_to_forget'] = entity_ids_to_forget
+            
+            # 计算fact的激活分数
+            fact_ids_to_forget = self.memory_manager.get_memories_to_forget(
+                self.fact_embedding_store,
+                current_query_embedding,
+                retention_ratio=retention_ratio
+            )
+            decay_stats['facts_to_forget'] = fact_ids_to_forget
+            
+            logger.info(f"Memory decay analysis: "
+                       f"Chunks {decay_stats['total_chunks']} -> {decay_stats['total_chunks'] - len(chunk_ids_to_forget)}, "
+                       f"Entities {decay_stats['total_entities']} -> {decay_stats['total_entities'] - len(entity_ids_to_forget)}, "
+                       f"Facts {decay_stats['total_facts']} -> {decay_stats['total_facts'] - len(fact_ids_to_forget)}")
+        
+        # 执行删除
+        if auto_forget and current_query_embedding is not None:
+            if decay_stats['chunks_to_forget']:
+                try:
+                    # 将hash_id转换为对应的文档内容进行删除
+                    docs_to_delete = [
+                        self.chunk_embedding_store.get_row(hash_id)['content'] 
+                        for hash_id in decay_stats['chunks_to_forget']
+                    ]
+                    if docs_to_delete:
+                        self.delete(docs_to_delete)
+                        decay_stats['auto_forgot_chunks'] = len(docs_to_delete)
+                except Exception as e:
+                    logger.warning(f"Error during auto-forget: {e}")
+                    decay_stats['auto_forget_error'] = str(e)
+        
+        return decay_stats
+    
+    def get_memory_activation_status(self, current_query: str = None) -> Dict:
+        """
+        获取所有记忆的动态激活状态。
+        
+        这对于理解当前查询上下文中哪些记忆是活跃的非常有用。
+        
+        Args:
+            current_query: 当前查询
+        
+        Returns:
+            包含激活分析的字典
+        """
+        if current_query is None or self.query_to_embedding['triple'].get(current_query) is None:
+            logger.warning("No valid current query for activation analysis.")
+            return {'error': 'No valid query'}
+        
+        current_query_embedding = self.query_to_embedding['triple'][current_query]
+        
+        # 计算chunk的激活分数
+        chunk_activation = self.memory_manager.calculate_batch_activation(
+            self.chunk_embedding_store,
+            current_query_embedding
+        )
+        
+        # 计算entity的激活分数
+        entity_activation = self.memory_manager.calculate_batch_activation(
+            self.entity_embedding_store,
+            current_query_embedding
+        )
+        
+        # 计算fact的激活分数
+        fact_activation = self.memory_manager.calculate_batch_activation(
+            self.fact_embedding_store,
+            current_query_embedding
+        )
+        
+        # 统计激活情况
+        def analyze_activation(activation_dict):
+            if not activation_dict:
+                return {}
+            
+            total_activation = np.array([s['total_activation'] for s in activation_dict.values()])
+            return {
+                'total_count': len(activation_dict),
+                'high_activation_count': int(np.sum(total_activation > 0.7)),
+                'medium_activation_count': int(np.sum((total_activation > 0.3) & (total_activation <= 0.7))),
+                'low_activation_count': int(np.sum((total_activation > 0.05) & (total_activation <= 0.3))),
+                'inactive_count': int(np.sum(total_activation <= 0.05)),
+                'avg_activation': float(np.mean(total_activation)),
+                'max_activation': float(np.max(total_activation))
+            }
+        
+        return {
+            'current_query': current_query,
+            'context_window_size': len(self.memory_manager.query_history),
+            'chunk_activation': analyze_activation(chunk_activation),
+            'entity_activation': analyze_activation(entity_activation),
+            'fact_activation': analyze_activation(fact_activation),
+            'top_5_chunks': sorted(
+                [(h, s['total_activation']) for h, s in chunk_activation.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )[:5]
+        }
+    
+    def manual_cleanup_low_activation_memories(self,
+                                               current_query: str = None,
+                                               activation_threshold: float = 0.1,
+                                               dry_run: bool = True) -> Dict:
+        """
+        手动清除低激活的记忆（用户可以在检查后手动触发）。
+        
+        Args:
+            current_query: 当前查询（用于计算激活分数）
+            activation_threshold: 激活分数阈值，低于此值的记忆会被标记为删除
+            dry_run: 如果True，仅列出要删除的项但不执行删除
+        
+        Returns:
+            包含清除统计的字典
+        """
+        if current_query is None or self.query_to_embedding['triple'].get(current_query) is None:
+            logger.warning("No valid current query for low activation cleanup.")
+            return {'error': 'No valid query'}
+        
+        current_query_embedding = self.query_to_embedding['triple'][current_query]
+        
+        cleanup_stats = {
+            'chunks_to_delete': [],
+            'entities_to_delete': [],
+            'facts_to_delete': [],
+            'dry_run': dry_run,
+            'activation_threshold': activation_threshold
+        }
+        
+        # 分析各个存储
+        for store_name, store in [
+            ('chunks', self.chunk_embedding_store),
+            ('entities', self.entity_embedding_store),
+            ('facts', self.fact_embedding_store)
+        ]:
+            all_activation = self.memory_manager.calculate_batch_activation(
+                store, current_query_embedding
+            )
+            
+            low_activation_items = [
+                hash_id for hash_id, scores in all_activation.items()
+                if scores['total_activation'] < activation_threshold
+            ]
+            
+            cleanup_stats[f'{store_name}_to_delete'] = low_activation_items
+            logger.info(f"Found {len(low_activation_items)} low-activation {store_name} "
+                       f"(activation < {activation_threshold})")
+        
+        # 执行删除（如果不是dry_run）
+        if not dry_run and cleanup_stats['chunks_to_delete']:
+            try:
+                docs_to_delete = [
+                    self.chunk_embedding_store.get_row(hash_id)['content']
+                    for hash_id in cleanup_stats['chunks_to_delete']
+                ]
+                if docs_to_delete:
+                    self.delete(docs_to_delete)
+                    cleanup_stats['actually_deleted_count'] = len(docs_to_delete)
+                    logger.info(f"Deleted {len(docs_to_delete)} documents with low activation")
+            except Exception as e:
+                logger.error(f"Error during manual cleanup: {e}")
+                cleanup_stats['error'] = str(e)
+        
+        return cleanup_stats
+    
+    def detect_and_resolve_fact_conflicts(self,
+                                         new_facts: List[Tuple[str, str, str]],
+                                         resolution_strategy: str = 'keep_new',
+                                         auto_apply: bool = False) -> Dict:
+        """
+        检测新事实与现有事实的冲突，并根据策略解决。
+        
+        Args:
+            new_facts: 新添加的事实列表
+            resolution_strategy: 冲突解决策略
+                - 'keep_new': 新事实覆盖旧事实（默认）
+                - 'keep_old': 保留旧事实，拒绝新事实
+                - 'merge': 合并为"可能是X或Y"
+                - 'keep_frequent': 保留访问频率更高的事实
+            auto_apply: 如果True，自动应用删除和合并操作
+        
+        Returns:
+            包含冲突检测和解决结果的字典
+        """
+        # 获取现有的事实
+        existing_facts = []
+        for fact_hash_id in self.fact_embedding_store.get_all_ids():
+            fact_str = self.fact_embedding_store.get_row(fact_hash_id)['content']
+            try:
+                # 尝试解析事实字符串
+                fact_tuple = eval(fact_str) if isinstance(fact_str, str) else fact_str
+                existing_facts.append(fact_tuple)
+            except:
+                # 如果无法解析，跳过
+                pass
+        
+        logger.info(f"Checking {len(new_facts)} new facts against {len(existing_facts)} existing facts")
+        
+        # 检测冲突
+        conflicts = self.conflict_resolver.detect_conflicts(existing_facts, new_facts)
+        logger.info(f"Detected {len(conflicts)} conflicts")
+        
+        # 构建必要的映射
+        fact_to_hash_id = {}
+        access_counts = {}
+        
+        for hash_id in self.fact_embedding_store.get_all_ids():
+            fact_str = self.fact_embedding_store.get_row(hash_id)['content']
+            fact_to_hash_id[fact_str] = hash_id
+            access_counts[hash_id] = self.fact_embedding_store.get_access_count(hash_id)
+        
+        # 批量解决冲突
+        resolution_results = self.conflict_resolver.batch_resolve_conflicts(
+            conflicts=conflicts,
+            existing_facts=existing_facts,
+            new_facts=new_facts,
+            fact_to_hash_id=fact_to_hash_id,
+            access_counts=access_counts,
+            strategy=resolution_strategy
+        )
+        
+        # 保存审计日志
+        self.conflict_resolver.save_audit_log()
+        
+        # 如果启用自动应用，执行删除和合并
+        if auto_apply:
+            # 删除被覆盖的事实
+            if resolution_results['facts_to_delete']:
+                try:
+                    self.fact_embedding_store.delete(resolution_results['facts_to_delete'])
+                    logger.info(f"Deleted {len(resolution_results['facts_to_delete'])} conflicted facts")
+                except Exception as e:
+                    logger.error(f"Error deleting conflicted facts: {e}")
+                    resolution_results['deletion_error'] = str(e)
+        
+        return resolution_results
     
     def run_ppr(self,
                 reset_prob: np.ndarray,
